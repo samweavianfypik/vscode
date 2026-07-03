@@ -8,6 +8,7 @@ import { CAPIClient, RequestType, type CCAModel, type IExtensionInformation } fr
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { getDevDeviceId, getMachineId } from '../../../../base/node/id.js';
 import { createDecorator } from '../../../instantiation/common/instantiation.js';
+import { IAgentHostGitHubEndpointService } from '../agentHostGitHubEndpointService.js';
 import { ILogService } from '../../../log/common/log.js';
 import { IProductService } from '../../../product/common/productService.js';
 import { COPILOT_LICENSE_AGREEMENT } from '../../../endpoint/common/licenseAgreement.js';
@@ -514,6 +515,7 @@ export class CopilotApiService implements ICopilotApiService {
 		fetchFn: FetchFunction | undefined,
 		@ILogService private readonly _logService: ILogService,
 		@IProductService private readonly _productService: IProductService,
+		@IAgentHostGitHubEndpointService private readonly _gitHubEndpointService: IAgentHostGitHubEndpointService,
 	) {
 		this._fetch = fetchFn ?? globalThis.fetch;
 	}
@@ -578,7 +580,18 @@ export class CopilotApiService implements ICopilotApiService {
 		}
 
 		const json = await response.json();
-		return json.data ?? [];
+		const data = json.data ?? [];
+		this._logService.info(`[CopilotApiService][TEMP] models count=${data.length} suppressIntegrationId=${options?.suppressIntegrationId} ids=[${(data as CCAModel[]).map(m => m.id).join(', ')}]`);
+		try {
+			const probe = await capiClient.makeRequest<Response>(
+				{ method: 'GET', headers: { ...options?.headers, 'Authorization': `Bearer ${githubToken}` }, suppressIntegrationId: !options?.suppressIntegrationId, signal: options?.signal },
+				{ type: RequestType.Models },
+			);
+			const pj = probe.ok ? await probe.json() : { data: [] };
+			const pd = pj.data ?? [];
+			this._logService.info(`[CopilotApiService][TEMP] PROBE suppressIntegrationId=${!options?.suppressIntegrationId} count=${pd.length} ids=[${(pd as CCAModel[]).map((m: CCAModel) => m.id).join(', ')}]`);
+		} catch (e) { this._logService.info(`[CopilotApiService][TEMP] PROBE failed: ${e}`); }
+		return data;
 	}
 
 	async responses(
@@ -711,10 +724,13 @@ export class CopilotApiService implements ICopilotApiService {
 			buildType: this._productService.quality === 'stable' ? 'prod' : 'dev',
 		};
 
-		// The user-info endpoint is hosted on api.github.com for consumer accounts.
-		// For GitHub Enterprise the host changes, but we don't currently support
-		// GHE in the agent host — see CopilotAgent for the same assumption.
-		const userUrl = 'https://api.github.com/copilot_internal/user';
+		// Copilot endpoint discovery: GET `/copilot_internal/user` on the GitHub API
+		// host. For GitHub Enterprise the host is derived from `githubEnterpriseUri`
+		// (via the endpoint service); the response's `endpoints.api` then carries the
+		// enterprise CAPI base that CAPIClient routes through. Defaults to
+		// api.github.com when no enterprise URI is set. (GHE Cloud `*.ghe.com` is
+		// handled; GHE Server on-prem `/copilot_internal` routing is unverified.)
+		const userUrl = `${this._gitHubEndpointService.getApiBaseUri()}/copilot_internal/user`;
 
 		return { extensionInfo, userUrl };
 	}
@@ -928,7 +944,12 @@ export class CopilotApiService implements ICopilotApiService {
 
 		capiClient.updateDomains(
 			{ endpoints: envelope.endpoints ?? {}, sku: envelope.access_type_sku ?? '' },
-			undefined,
+			// Enterprise base URI (e.g. `https://acme.ghe.com`), or `undefined` for
+			// github.com. The package derives the GitHub API host (`api.<host>`) from
+			// this for `copilot_internal` endpoints - notably the Copilot session
+			// token mint (`/copilot_internal/v2/token`). Omitting it strands the mint
+			// on `api.github.com`, which 401s an enterprise token ("Bad credentials").
+			this._gitHubEndpointService.getEnterpriseUri(),
 		);
 
 		this._logService.debug('[CopilotApiService] CAPI endpoint discovered, api=', envelope.endpoints?.api);
